@@ -1,0 +1,13 @@
+[package]
+name = "delta-tool"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+zstd = "0.13"
+sha2 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+base64 = "0.22"
+getrandom = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

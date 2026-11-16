@@ -1,0 +1,43 @@
+[package]
+name = "mreader"
+version = "0.1.0"
+description = "mReader — quiet monochrome RSS reader"
+authors = ["Moreweb"]
+edition = "2021"
+
+[lib]
+name = "mreader_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "time", "macros"] }
+rusqlite = { version = "0.43", default-features = false, features = ["bundled", "cache"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "charset", "http2", "gzip", "deflate"] }
+feed-rs = "3.0"
+scraper = "0.29"
+ammonia = "4.2"
+quick-xml = "0.42"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+sha2 = "0.10"
+url = "2"
+zstd = "0.13"
+ed25519-dalek = "2"
+base64 = "0.22"
+semver = "1"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1"
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+opt-level = "s"

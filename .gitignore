@@ -1,0 +1,27 @@
+# Logs & dependencies
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Rust / Tauri
+src-tauri/target/
+scripts/delta-tool/target/
+src-tauri/gen/schemas/
+src-tauri/gen/android/.gradle/
+src-tauri/gen/android/.kotlin/
+src-tauri/gen/android/app/build/
+src-tauri/gen/android/build/
+src-tauri/gen/android/local.properties
+src-tauri/gen/android/keystore.properties
+src-tauri/gen/android/**/*.keystore
+src-tauri/gen/android/**/*.jks
+src-tauri/gen/android/**/*.p12
+src-tauri/gen/android/app/src/main/jniLibs/
+src-tauri/gen/android/tauri.settings.gradle
+
+# Release / test output
+artifacts/
+test-results/
+coverage/
+.shots/

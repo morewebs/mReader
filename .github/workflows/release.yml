@@ -1,0 +1,342 @@
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CI: true
+  CARGO_TERM_COLOR: always
+
+jobs:
+  preflight:
+    name: Validate release version and manifests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Verify manifests match
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkg_ver="$(node -p 'JSON.parse(require("fs").readFileSync("package.json", "utf8")).version')"
+          tauri_conf="$(node -e 'const c=JSON.parse(require("fs").readFileSync("src-tauri/tauri.conf.json","utf8")); console.log(c.version + "|" + (c.bundle?.android?.versionCode ?? ""))')"
+          tauri_ver="${tauri_conf%%|*}"
+          version_code="${tauri_conf##*|}"
+          cargo_ver="$(sed -n 's/^version = "\([^"]*\)"/\1/p' src-tauri/Cargo.toml | head -n 1)"
+
+          if [ "$pkg_ver" != "$tauri_ver" ] || [ "$pkg_ver" != "$cargo_ver" ]; then
+            echo "::error::Manifest version mismatch: package.json=$pkg_ver, tauri.conf.json=$tauri_ver, Cargo.toml=$cargo_ver"
+            exit 1
+          fi
+          if [ -z "$version_code" ]; then
+            echo "::error::src-tauri/tauri.conf.json is missing bundle.android.versionCode"
+            exit 1
+          fi
+
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag="${GITHUB_REF_NAME}"
+            expected="${tag#v}"
+            if [ "$expected" != "$pkg_ver" ]; then
+              echo "::error::Tag $tag does not match manifest version $pkg_ver"
+              exit 1
+            fi
+          else
+            tag="v${pkg_ver}"
+          fi
+
+          echo "version=${pkg_ver}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "Release metadata verified: tag=$tag version=$pkg_ver androidVersionCode=$version_code"
+
+  windows:
+    name: Build Windows (x64)
+    needs: preflight
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      MREADER_UPDATE_PUBKEY: ${{ secrets.MREADER_UPDATE_PUBKEY }}
+      MREADER_UPDATE_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      - run: npx tauri build --bundles nsis,msi
+      - name: Stage Windows installers and update binary
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          New-Item -ItemType Directory -Path release-assets -Force | Out-Null
+          $nsis = Get-ChildItem -Path src-tauri/target/release/bundle/nsis -Filter '*.exe' | Select-Object -First 1
+          $msi = Get-ChildItem -Path src-tauri/target/release/bundle/msi -Filter '*.msi' | Select-Object -First 1
+          $bin = 'src-tauri/target/release/mreader.exe'
+          if (-not $nsis) { throw 'NSIS installer missing' }
+          if (-not $msi) { throw 'MSI installer missing' }
+          if (-not (Test-Path $bin)) { throw 'Standalone mreader.exe missing' }
+          Copy-Item $nsis.FullName "release-assets/mReader_${env:VERSION}_x64-setup.exe"
+          Copy-Item $nsis.FullName "release-assets/mReader-Setup-x64.exe"
+          Copy-Item $msi.FullName "release-assets/mReader_${env:VERSION}_x64_en-US.msi"
+          Copy-Item $msi.FullName "release-assets/mReader-Setup-x64.msi"
+          Copy-Item $bin "release-assets/mReader-win-x64.exe"
+          Get-ChildItem release-assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-assets
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+  linux:
+    name: Build Linux (x86_64)
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      APPIMAGE_EXTRACT_AND_RUN: "1"
+      MREADER_UPDATE_PUBKEY: ${{ secrets.MREADER_UPDATE_PUBKEY }}
+      MREADER_UPDATE_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Linux Tauri dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      - run: npx tauri build --bundles appimage,deb
+      - name: Stage Linux packages and update binary
+        shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          APPIMAGE="$(find src-tauri/target/release/bundle/appimage -maxdepth 1 -name '*.AppImage' | head -n 1)"
+          DEB="$(find src-tauri/target/release/bundle/deb -maxdepth 1 -name '*.deb' | head -n 1)"
+          BIN="src-tauri/target/release/mreader"
+          test -n "$APPIMAGE"
+          test -n "$DEB"
+          test -s "$BIN"
+          cp "$APPIMAGE" "release-assets/mReader_${VERSION}_amd64.AppImage"
+          cp "$APPIMAGE" "release-assets/mReader-x86_64.AppImage"
+          cp "$DEB" "release-assets/mReader_${VERSION}_amd64.deb"
+          cp "$DEB" "release-assets/mReader-amd64.deb"
+          cp "$BIN" "release-assets/mReader-linux-x64"
+          ls -la release-assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-assets
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+  android:
+    name: Build Android (universal & arm64)
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      MREADER_UPDATE_PUBKEY: ${{ secrets.MREADER_UPDATE_PUBKEY }}
+      MREADER_UPDATE_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('src-tauri/gen/android/**/*.gradle*', 'src-tauri/gen/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+      - name: Configure Android SDK and NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDKMANAGER="$(ls -1 "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -n 1)"
+          set +o pipefail
+          yes | "$SDKMANAGER" --licenses > /dev/null
+          set -o pipefail
+          "$SDKMANAGER" --install "platforms;android-37.0"
+          NDK="$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -n 1)"
+          test -n "$NDK"
+          echo "NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "sdk.dir=$ANDROID_HOME" > src-tauri/gen/android/local.properties
+      - name: Configure Android release signing if secrets are set
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEYSTORE_ALIAS: ${{ secrets.ANDROID_KEYSTORE_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEYSTORE_BASE64:-}" ]; then
+            echo "::warning::ANDROID_KEYSTORE_BASE64 not set; APKs will be signed with the debug keystore."
+            exit 0
+          fi
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > src-tauri/gen/android/app/mreader-release.keystore
+          {
+            echo "storeFile=mreader-release.keystore"
+            echo "storePassword=${KEYSTORE_PASSWORD}"
+            echo "keyAlias=${KEYSTORE_ALIAS}"
+            echo "keyPassword=${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
+          } > src-tauri/gen/android/keystore.properties
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: npx tauri android build --apk
+      - run: npx tauri android build --apk --split-per-abi --target aarch64
+      - name: Verify and stage APKs
+        shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          APKSIGNER="$(ls -1 "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n 1)"
+          UNIVERSAL_APK="src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk"
+          ARM64_APK="src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release.apk"
+          test -s "$UNIVERSAL_APK"
+          test -s "$ARM64_APK"
+          "$APKSIGNER" verify --verbose --print-certs "$UNIVERSAL_APK"
+          "$APKSIGNER" verify --verbose --print-certs "$ARM64_APK"
+          cp "$UNIVERSAL_APK" "release-assets/mReader_${VERSION}_universal.apk"
+          cp "$UNIVERSAL_APK" "release-assets/mReader-universal.apk"
+          cp "$ARM64_APK" "release-assets/mReader_${VERSION}_arm64.apk"
+          cp "$ARM64_APK" "release-assets/mReader-arm64.apk"
+          ls -la release-assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-assets
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Build delta patches and publish GitHub Release
+    needs: [preflight, windows, linux, android]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: scripts/delta-tool -> target
+      - name: Build delta-tool
+        run: cargo build --release --manifest-path scripts/delta-tool/Cargo.toml
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: publish-assets
+          merge-multiple: true
+      - name: Generate multi-base delta patches and sign update manifest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MREADER_UPDATE_PRIVKEY: ${{ secrets.MREADER_UPDATE_PRIVKEY }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          node scripts/build-update-manifest.mjs \
+            --repo "$GITHUB_REPOSITORY" \
+            --version "$VERSION" \
+            --tag "$TAG" \
+            --assets-dir publish-assets \
+            --tool scripts/delta-tool/target/release/delta-tool
+      - name: Generate SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd publish-assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" publish-assets/* --clobber
+          else
+            gh release create "$TAG" publish-assets/* \
+              --title "mReader ${VERSION}" \
+              --generate-notes
+          fi
